@@ -51,6 +51,26 @@ UnencryptedMessage ReadHandshakeMessage(const ReadFrame& read) {
     return msg;
 }
 
+// Reads the next handshake message that ISN'T a plaintext msgs_ack,
+// discarding any in between. Real clients (observed live: an Android
+// Telegram fork) plaintext-acknowledge every server handshake reply
+// (ResPQ, server_DH_params_ok) with msgs_ack#62d6b459 before sending their
+// own next real message, sometimes batched into the same TCP segment as
+// that next message. msgs_ack needs no reply and carries no handshake
+// state, so every ReadHandshakeMessage call site in this exchange must go
+// through this wrapper instead of calling it directly -- see
+// NOTES/server-exchange-msgs-ack-plan.md (this is the second call site
+// that needed it; the first one's own fix is what that note documents).
+UnencryptedMessage ReadNextRealHandshakeMessage(const ReadFrame& read) {
+    for (;;) {
+        UnencryptedMessage msg = ReadHandshakeMessage(read);
+        TLBuffer peek;
+        peek.buf = msg.message_data;
+        if (peek.PeekID() == messages::MsgsAck::kTypeId) continue;
+        return msg;
+    }
+}
+
 void WriteHandshakeMessage(const WriteFrame& write, MessageType type, const TLBuffer& payload) {
     UnencryptedMessage msg;
     msg.message_id = MessageId::New(std::chrono::system_clock::now(), type).Raw();
@@ -158,28 +178,20 @@ ServerExchangeResult ServerExchange::Run(const ReadFrame& read, const WriteFrame
             WriteHandshakeMessage(write, MessageType::kServerResponse, payload);
         }
 
-        // Some real clients (observed: an Android Telegram fork) plaintext-
-        // acknowledge ResPQ with a msgs_ack before sending req_DH_params,
-        // sometimes batched into the same TCP segment as req_DH_params
-        // itself. msgs_ack needs no reply and carries no handshake state, so
-        // it's silently discarded here -- read again WITHOUT resending
-        // ResPQ, which stays reserved for an actual retried req_pq(_multi).
-        for (;;) {
-            const UnencryptedMessage next = ReadHandshakeMessage(read);
-            TLBuffer b;
-            b.buf = next.message_data;
-            const std::uint32_t id = b.PeekID();
-            if (id == messages::MsgsAck::kTypeId) {
-                continue;
-            }
-            if (id == kReqPqRequestTypeId || id == kReqPqMultiRequestTypeId) {
-                req.Decode(b); // client resent a fake req_pq with a new nonce; loop and resend ResPQ
-                break;
-            }
-            dh_params.Decode(b);
-            got_dh_params = true;
-            break;
+        // ReadNextRealHandshakeMessage already discards any plaintext
+        // msgs_ack a real client sends acknowledging ResPQ (see its own
+        // doc comment) -- resending ResQ stays reserved for an actual
+        // retried req_pq(_multi) below, never triggered by an ack.
+        const UnencryptedMessage next = ReadNextRealHandshakeMessage(read);
+        TLBuffer b;
+        b.buf = next.message_data;
+        const std::uint32_t id = b.PeekID();
+        if (id == kReqPqRequestTypeId || id == kReqPqMultiRequestTypeId) {
+            req.Decode(b); // client resent a fake req_pq with a new nonce; loop and resend ResPQ
+            continue;
         }
+        dh_params.Decode(b);
+        got_dh_params = true;
     }
 
     // 3. RSA_PAD-decrypt req_DH_params.encrypted_data, then TL-decode
@@ -255,9 +267,12 @@ ServerExchangeResult ServerExchange::Run(const ReadFrame& read, const WriteFrame
     }
 
     // 6. Client replies with Set_client_DH_params carrying g_b.
+    // ReadNextRealHandshakeMessage discards a plaintext msgs_ack
+    // acknowledging server_DH_params_ok if one arrives first (same
+    // real-client quirk as the req_DH_params wait above).
     SetClientDhParams client_params;
     {
-        const UnencryptedMessage msg = ReadHandshakeMessage(read);
+        const UnencryptedMessage msg = ReadNextRealHandshakeMessage(read);
         TLBuffer b;
         b.buf = msg.message_data;
         client_params.Decode(b);

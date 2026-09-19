@@ -1,5 +1,7 @@
 #include "shuzagram/mtproto/tcp_handshake_server.hpp"
 
+#include <cstdio>
+#include <cstdlib>
 #include <optional>
 #include <thread>
 
@@ -8,6 +10,31 @@
 #include "shuzagram/mtproto/transport/detect_transport.hpp"
 
 namespace shuzagram::mtproto {
+namespace {
+
+// Temporary field diagnostic (SHUZAGRAM_DEBUG_TRANSPORT=1): dumps every raw
+// byte a connection actually sent, regardless of where parsing failed, to
+// stderr. Real clients in the wild have already turned up two undocumented
+// quirks (obfuscated2, and a plaintext msgs_ack before req_DH_params) that
+// no synthetic test predicted -- this exists to see the NEXT one directly
+// instead of guessing from exception messages alone.
+bool DebugTransportEnabled() {
+    const char* v = std::getenv("SHUZAGRAM_DEBUG_TRANSPORT");
+    return v && *v && std::string(v) != "0";
+}
+
+void LogRawBytes(const std::vector<std::uint8_t>& bytes, const char* what) {
+    std::string hex;
+    hex.reserve(bytes.size() * 2);
+    static const char kHex[] = "0123456789abcdef";
+    for (const auto b : bytes) {
+        hex.push_back(kHex[b >> 4]);
+        hex.push_back(kHex[b & 0xF]);
+    }
+    std::fprintf(stderr, "[transport debug] %s (%zu bytes): %s\n", what, bytes.size(), hex.c_str());
+}
+
+} // namespace
 
 TcpHandshakeServer::TcpHandshakeServer(const std::string& bind_address, std::uint16_t port, crypto::RsaPrivateKey key,
                                         const RpcHandlerRegistry* rpc_registry)
@@ -28,9 +55,18 @@ void TcpHandshakeServer::Run(const SuccessHandler& on_success, const FailureHand
         // round's goal (prove the wiring works), not a production-grade
         // connection-handling model. See NOTES/tcp-wiring-plan.md.
         std::thread([this, socket = std::move(*socket), on_success, on_failure]() mutable {
+            const bool debug = DebugTransportEnabled();
+            auto raw_log = std::make_shared<std::vector<std::uint8_t>>();
             try {
-                auto reader = socket.Reader();
+                auto raw_reader = socket.Reader();
                 auto writer = socket.Writer();
+                mtproto::transport::ReadExact reader = raw_reader;
+                if (debug) {
+                    reader = [raw_reader, raw_log](std::uint8_t* dst, std::size_t len) {
+                        raw_reader(dst, len);
+                        raw_log->insert(raw_log->end(), dst, dst + len);
+                    };
+                }
                 // DetectTransport (not the bare DetectCodec this project
                 // used before this round) transparently also accepts
                 // obfuscated2 -- what a real client sends by default -- see
@@ -68,8 +104,10 @@ void TcpHandshakeServer::Run(const SuccessHandler& on_success, const FailureHand
                     }
                 }
             } catch (const std::exception& e) {
+                if (debug) LogRawBytes(*raw_log, e.what());
                 if (on_failure) on_failure(e.what());
             } catch (...) {
+                if (debug) LogRawBytes(*raw_log, "unknown error");
                 if (on_failure) on_failure("unknown error");
             }
         }).detach();

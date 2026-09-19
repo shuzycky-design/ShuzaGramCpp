@@ -271,6 +271,16 @@ ClientResult RunFakeClient(FrameChannel& to_server, FrameChannel& from_server, c
         ok.encrypted_answer = b.GetBytes();
     }
 
+    // Second regression case for the same real-client quirk: msgs_ack
+    // acknowledging server_DH_params_ok, before Set_client_DH_params.
+    {
+        MsgsAck ack;
+        ack.msg_ids = {5678};
+        TLBuffer payload;
+        ack.Encode(payload);
+        to_server.Push(WrapUnencrypted(MessageType::kFromClient, payload));
+    }
+
     std::vector<std::uint8_t> temp_key, temp_iv;
     crypto::TempAesKeys(new_nonce, res.server_nonce, temp_key, temp_iv);
 
