@@ -23,6 +23,7 @@
 #include "shuzagram/mtproto/crypto/rsa.hpp"
 #include "shuzagram/mtproto/crypto/rsa_pad.hpp"
 #include "shuzagram/mtproto/messages/handshake.hpp"
+#include "shuzagram/mtproto/messages/system.hpp"
 #include "shuzagram/mtproto/server_exchange.hpp"
 #include "shuzagram/mtproto/unencrypted_message.hpp"
 
@@ -199,6 +200,19 @@ ClientResult RunFakeClient(FrameChannel& to_server, FrameChannel& from_server, c
         res.pq = b.GetBytes();
         const auto count = b.VectorHeader();
         for (int i = 0; i < count; ++i) res.server_public_key_fingerprints.push_back(b.Long());
+    }
+
+    // Regression coverage: a real client (observed live, an Android
+    // Telegram fork) plaintext-acknowledges ResPQ with a msgs_ack before
+    // sending req_DH_params -- sometimes in the very same TCP segment. This
+    // must not break the handshake (see NOTES/obfuscated2-transport-plan.md's
+    // sibling note on the exact live failure this reproduces).
+    {
+        MsgsAck ack;
+        ack.msg_ids = {1234};
+        TLBuffer payload;
+        ack.Encode(payload);
+        to_server.Push(WrapUnencrypted(MessageType::kFromClient, payload));
     }
 
     const auto [p, q] = DecomposePq(BytesToU64(res.pq), rng);

@@ -9,6 +9,7 @@
 #include "shuzagram/mtproto/crypto/random.hpp"
 #include "shuzagram/mtproto/crypto/rsa_pad.hpp"
 #include "shuzagram/mtproto/messages/handshake.hpp"
+#include "shuzagram/mtproto/messages/system.hpp"
 #include "shuzagram/mtproto/unencrypted_message.hpp"
 #include "shuzagram/mtproto/unexpected_encrypted_frame.hpp"
 
@@ -144,7 +145,8 @@ ServerExchangeResult ServerExchange::Run(const ReadFrame& read, const WriteFrame
     const std::vector<std::uint8_t> pq = FixedPq();
 
     ReqDhParams dh_params;
-    for (;;) {
+    bool got_dh_params = false;
+    while (!got_dh_params) {
         {
             ResPq res;
             res.nonce = req.nonce;
@@ -156,16 +158,28 @@ ServerExchangeResult ServerExchange::Run(const ReadFrame& read, const WriteFrame
             WriteHandshakeMessage(write, MessageType::kServerResponse, payload);
         }
 
-        const UnencryptedMessage next = ReadHandshakeMessage(read);
-        TLBuffer b;
-        b.buf = next.message_data;
-        const std::uint32_t id = b.PeekID();
-        if (id == kReqPqRequestTypeId || id == kReqPqMultiRequestTypeId) {
-            req.Decode(b); // client resent a fake req_pq with a new nonce; loop and resend ResPQ
-            continue;
+        // Some real clients (observed: an Android Telegram fork) plaintext-
+        // acknowledge ResPQ with a msgs_ack before sending req_DH_params,
+        // sometimes batched into the same TCP segment as req_DH_params
+        // itself. msgs_ack needs no reply and carries no handshake state, so
+        // it's silently discarded here -- read again WITHOUT resending
+        // ResPQ, which stays reserved for an actual retried req_pq(_multi).
+        for (;;) {
+            const UnencryptedMessage next = ReadHandshakeMessage(read);
+            TLBuffer b;
+            b.buf = next.message_data;
+            const std::uint32_t id = b.PeekID();
+            if (id == messages::MsgsAck::kTypeId) {
+                continue;
+            }
+            if (id == kReqPqRequestTypeId || id == kReqPqMultiRequestTypeId) {
+                req.Decode(b); // client resent a fake req_pq with a new nonce; loop and resend ResPQ
+                break;
+            }
+            dh_params.Decode(b);
+            got_dh_params = true;
+            break;
         }
-        dh_params.Decode(b);
-        break;
     }
 
     // 3. RSA_PAD-decrypt req_DH_params.encrypted_data, then TL-decode
