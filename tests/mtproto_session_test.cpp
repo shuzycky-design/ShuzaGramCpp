@@ -52,6 +52,14 @@ std::vector<std::uint8_t> EncodePing(std::int64_t ping_id) {
     return b.buf;
 }
 
+std::vector<std::uint8_t> EncodePingDelayDisconnect(std::int64_t ping_id, int disconnect_delay) {
+    TLBuffer b;
+    b.PutID(messages::PingDelayDisconnect::kTypeId);
+    b.PutLong(ping_id);
+    b.PutInt32(disconnect_delay);
+    return b.buf;
+}
+
 std::vector<std::uint8_t> EncodeUnknownCall(std::uint32_t fake_constructor_id) {
     TLBuffer b;
     b.PutID(fake_constructor_id);
@@ -83,6 +91,36 @@ void TestPingPong() {
     Check(pong_msg_id == ping_msg_id, "pong.msg_id echoes the original ping message's own msg_id");
     Check(pong_ping_id == 0xABCD, "pong.ping_id matches the ping's ping_id");
     Check(reply_data.session_id == session_id, "reply carries the correct session_id");
+}
+
+// ping_delay_disconnect#f3427b8c -- the keepalive variant a real Android
+// client (OwpenGram) turned out to send exclusively, instead of plain
+// ping. Found live: it fell through to METHOD_NOT_FOUND, which looked to
+// the client like the connection was unhealthy ("infinite loading").
+void TestPingDelayDisconnectGetsPong() {
+    const AuthKeyBytes key = RandomAuthKey();
+    const std::int64_t session_id = 111;
+    const std::int64_t salt = 222;
+
+    MtprotoSession server(key, session_id, salt, Side::kServer);
+
+    std::int64_t ping_msg_id = 0;
+    const EncryptedMessage request =
+        ClientEncrypt(key, salt, session_id, EncodePingDelayDisconnect(0x1234, 75), &ping_msg_id);
+
+    const auto replies = server.HandleEncrypted(request);
+    Check(replies.size() == 1, "ping_delay_disconnect produces exactly one reply");
+    if (replies.empty()) return;
+
+    const EncryptedMessageData reply_data = DecryptMessage(key, replies[0], Side::kClient);
+    TLBuffer b;
+    b.buf = reply_data.message_data;
+    b.ConsumeID(messages::Pong::kTypeId);
+    const std::int64_t pong_msg_id = b.Long();
+    const std::int64_t pong_ping_id = b.Long();
+
+    Check(pong_msg_id == ping_msg_id, "ping_delay_disconnect: pong.msg_id echoes the request's own msg_id");
+    Check(pong_ping_id == 0x1234, "ping_delay_disconnect: pong.ping_id matches, same as plain ping's reply shape");
 }
 
 void TestUnknownRpcGetsMethodNotFound() {
@@ -236,6 +274,7 @@ void TestReplayProtectionRejectsNonIncreasingMsgId() {
 
 int main() {
     TestPingPong();
+    TestPingDelayDisconnectGetsPong();
     TestUnknownRpcGetsMethodNotFound();
     TestRegisteredHandlerIsUsed();
     TestMsgsAckProducesNoReply();

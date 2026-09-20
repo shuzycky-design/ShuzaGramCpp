@@ -92,6 +92,23 @@ std::vector<std::uint8_t> MtprotoSession::DispatchOne(std::int64_t msg_id, const
         pong.Encode(out);
         return out.buf;
     }
+    if (id == PingDelayDisconnect::kTypeId) {
+        // Same Pong response as plain Ping -- see PingDelayDisconnect's own
+        // doc comment for why disconnect_delay itself is ignored. Real
+        // clients (this gap was found live, via a real Android client that
+        // uses this variant exclusively for its keepalive) send THIS, not
+        // plain Ping -- answering it with METHOD_NOT_FOUND instead of a
+        // real Pong looks to the client like the connection is unhealthy.
+        b.ConsumeID(id);
+        PingDelayDisconnect ping;
+        ping.DecodeBare(b);
+        Pong pong;
+        pong.msg_id = msg_id;
+        pong.ping_id = ping.ping_id;
+        TLBuffer out;
+        pong.Encode(out);
+        return out.buf;
+    }
     if (id == MsgsAck::kTypeId) {
         // Nothing to do this round: we don't track our own outbound
         // delivery-confirmation state yet (see NOTES/rpc-dispatch-plan.md).

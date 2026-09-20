@@ -76,6 +76,23 @@ struct Ping {
     void DecodeBare(TLBuffer& b) { ping_id = b.Long(); }
 };
 
+// ping_delay_disconnect#f3427b8c ping_id:long disconnect_delay:int = Pong;
+// The variant real clients actually send for their keepalive: same Pong
+// response as plain ping, plus a hint ("disconnect me if you don't hear
+// from me again within disconnect_delay seconds") this server doesn't act
+// on -- answering with a normal Pong is enough to satisfy the client's own
+// liveness check.
+struct PingDelayDisconnect {
+    static constexpr std::uint32_t kTypeId = 0xf3427b8c;
+    std::int64_t ping_id = 0;
+    int disconnect_delay = 0;
+
+    void DecodeBare(TLBuffer& b) {
+        ping_id = b.Long();
+        disconnect_delay = b.Int32();
+    }
+};
+
 // pong#347773c5 msg_id:long ping_id:long = Pong;
 struct Pong {
     static constexpr std::uint32_t kTypeId = 0x347773c5;
