@@ -1,5 +1,9 @@
 #include "shuzagram/mtproto/tcp_handshake_server.hpp"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+
 #include <cstdio>
 #include <cstdlib>
 #include <optional>
@@ -55,7 +59,22 @@ bool DebugTransportEnabled() {
     return v && *v && std::string(v) != "0";
 }
 
-void LogRawBytes(const std::vector<std::uint8_t>& bytes, const char* what) {
+// This server sits on the public internet, and port scanners hit it
+// constantly with unrelated junk (bare HTTP GETs, connections opened and
+// closed with zero bytes, ...) -- indistinguishable from a real client's
+// own failed attempt without knowing WHO sent it. Public internet-facing
+// server, so plain diagnostic info in a debug-only log, not a privacy
+// concern.
+std::string PeerAddress(int fd) {
+    sockaddr_in addr{};
+    socklen_t len = sizeof(addr);
+    if (getpeername(fd, reinterpret_cast<sockaddr*>(&addr), &len) != 0) return "unknown";
+    char buf[INET_ADDRSTRLEN];
+    if (!inet_ntop(AF_INET, &addr.sin_addr, buf, sizeof(buf))) return "unknown";
+    return std::string(buf) + ":" + std::to_string(ntohs(addr.sin_port));
+}
+
+void LogRawBytes(const std::string& peer, const std::vector<std::uint8_t>& bytes, const char* what) {
     std::string hex;
     hex.reserve(bytes.size() * 2);
     static const char kHex[] = "0123456789abcdef";
@@ -63,7 +82,7 @@ void LogRawBytes(const std::vector<std::uint8_t>& bytes, const char* what) {
         hex.push_back(kHex[b >> 4]);
         hex.push_back(kHex[b & 0xF]);
     }
-    std::fprintf(stderr, "[transport debug] %s (%zu bytes): %s\n", what, bytes.size(), hex.c_str());
+    std::fprintf(stderr, "[transport debug] %s: %s (%zu bytes): %s\n", peer.c_str(), what, bytes.size(), hex.c_str());
 }
 
 } // namespace
@@ -91,6 +110,7 @@ void TcpHandshakeServer::Run(const SuccessHandler& on_success, const FailureHand
         // connection-handling model. See NOTES/tcp-wiring-plan.md.
         std::thread([this, socket = std::move(*socket), on_success, on_failure]() mutable {
             const bool debug = DebugTransportEnabled();
+            const std::string peer = debug ? PeerAddress(socket.fd()) : std::string();
             auto raw_log = std::make_shared<std::vector<std::uint8_t>>();
             try {
                 auto raw_reader = socket.Reader();
@@ -207,10 +227,10 @@ void TcpHandshakeServer::Run(const SuccessHandler& on_success, const FailureHand
                     handle_frame(frame);
                 }
             } catch (const std::exception& e) {
-                if (debug) LogRawBytes(*raw_log, e.what());
+                if (debug) LogRawBytes(peer, *raw_log, e.what());
                 if (on_failure) on_failure(e.what());
             } catch (...) {
-                if (debug) LogRawBytes(*raw_log, "unknown error");
+                if (debug) LogRawBytes(peer, *raw_log, "unknown error");
                 if (on_failure) on_failure("unknown error");
             }
         }).detach();
