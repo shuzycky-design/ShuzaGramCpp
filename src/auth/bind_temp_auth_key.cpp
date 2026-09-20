@@ -55,7 +55,6 @@ domain::TempAuthKeyBindingResult BindTempAuthKey(store::IAuthKeyStore& auth_keys
         // actually-bad ciphertext: never reveal which case it was.
         throw EncryptedMessageInvalidError();
     }
-
     mtproto::messages::BindAuthKeyInner inner;
     try {
         inner = mtproto::crypto::DecryptBindAuthKeyInner(pair.permanent.value, req.encrypted_message);
@@ -63,12 +62,13 @@ domain::TempAuthKeyBindingResult BindTempAuthKey(store::IAuthKeyStore& auth_keys
         throw EncryptedMessageInvalidError();
     }
 
-    if (inner.nonce != req.nonce || inner.temp_auth_key_id != AuthKeyIdToInt64(req.temp_auth_key_id) ||
-        inner.perm_auth_key_id != req.perm_auth_key_id || inner.temp_session_id != req.temp_session_id ||
+    if (inner.nonce != req.nonce ||
+        inner.temp_auth_key_id != AuthKeyIdToInt64(req.temp_auth_key_id) ||
+        inner.perm_auth_key_id != req.perm_auth_key_id ||
+        inner.temp_session_id != req.temp_session_id ||
         inner.expires_at != req.expires_at) {
         throw EncryptedMessageInvalidError();
     }
-
     // Re-check: decrypting/validating the proof took nonzero time, and the
     // temp key's expiry is a hard protocol boundary -- matches the Go
     // source's identical second check right before persisting.
@@ -76,6 +76,7 @@ domain::TempAuthKeyBindingResult BindTempAuthKey(store::IAuthKeyStore& auth_keys
 
     domain::TempAuthKeyBinding binding;
     binding.temp_auth_key_id = req.temp_auth_key_id;
+    binding.perm_auth_key_id = req.perm_auth_key_id;
     binding.perm_auth_key_id = req.perm_auth_key_id;
     binding.nonce = req.nonce;
     binding.temp_session_id = req.temp_session_id;
