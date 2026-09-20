@@ -131,8 +131,23 @@ std::vector<std::uint8_t> MtprotoSession::DispatchOne(std::int64_t msg_id, const
         }
     }
     if (debug) {
-        std::fprintf(stderr, "[rpc debug] method=0x%08x -> %s\n", id,
-                      result.empty() ? "METHOD_NOT_FOUND (400)" : "handled");
+        if (result.empty()) {
+            std::fprintf(stderr, "[rpc debug] method=0x%08x -> METHOD_NOT_FOUND (400)\n", id);
+        } else {
+            TLBuffer peek;
+            peek.buf = result;
+            const std::uint32_t result_id = peek.PeekID();
+            if (result_id == RpcError::kTypeId) {
+                peek.ConsumeID(result_id);
+                const int error_code = peek.Int32();
+                const std::vector<std::uint8_t> msg_bytes = peek.GetBytes();
+                const std::string error_message(msg_bytes.begin(), msg_bytes.end());
+                std::fprintf(stderr, "[rpc debug] method=0x%08x -> rpc_error code=%d message=%s\n", id, error_code,
+                              error_message.c_str());
+            } else {
+                std::fprintf(stderr, "[rpc debug] method=0x%08x -> handled (result id=0x%08x)\n", id, result_id);
+            }
+        }
     }
     if (result.empty()) {
         RpcError error;
