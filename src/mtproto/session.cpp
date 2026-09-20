@@ -2,13 +2,30 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
+#include <string>
 
 #include "shuzagram/mtproto/messages/invoke.hpp"
 #include "shuzagram/mtproto/messages/system.hpp"
 #include "shuzagram/mtproto/unencrypted_message.hpp"
 
 namespace shuzagram::mtproto {
+namespace {
+
+// Same SHUZAGRAM_DEBUG_TRANSPORT toggle tcp_handshake_server.cpp uses --
+// once a connection reaches this class, its transport/handshake layer is
+// already trusted, but a real client's very first RPC calls (what method,
+// does the registry actually have it) have turned out to matter just as
+// much: OwpenGram completed both handshakes cleanly and then just sat
+// there, connection eventually closed by the peer, with zero visibility
+// into what it actually asked for. See NOTES/rpc-visibility-plan.md.
+bool DebugTransportEnabled() {
+    const char* v = std::getenv("SHUZAGRAM_DEBUG_TRANSPORT");
+    return v && *v && std::string(v) != "0";
+}
+
+} // namespace
 
 MtprotoSession::MtprotoSession(crypto::AuthKeyBytes auth_key, std::int64_t session_id, std::int64_t server_salt,
                                 crypto::Side my_side, const RpcHandlerRegistry* registry)
@@ -61,6 +78,8 @@ std::vector<std::uint8_t> MtprotoSession::DispatchOne(std::int64_t msg_id, const
     }
 
     const std::uint32_t id = b.PeekID();
+    const bool debug = DebugTransportEnabled();
+    if (debug) std::fprintf(stderr, "[rpc debug] incoming method=0x%08x\n", id);
 
     if (id == Ping::kTypeId) {
         b.ConsumeID(id);
@@ -86,8 +105,17 @@ std::vector<std::uint8_t> MtprotoSession::DispatchOne(std::int64_t msg_id, const
         if (const RpcHandler* handler = registry_->Find(id)) {
             b.ConsumeID(id);
             const RpcContext ctx{crypto::AuthKeyId(auth_key_), session_id_};
-            result = (*handler)(id, b, ctx);
+            try {
+                result = (*handler)(id, b, ctx);
+            } catch (const std::exception& e) {
+                if (debug) std::fprintf(stderr, "[rpc debug] method=0x%08x handler threw: %s\n", id, e.what());
+                throw;
+            }
         }
+    }
+    if (debug) {
+        std::fprintf(stderr, "[rpc debug] method=0x%08x -> %s\n", id,
+                      result.empty() ? "METHOD_NOT_FOUND (400)" : "handled");
     }
     if (result.empty()) {
         RpcError error;
