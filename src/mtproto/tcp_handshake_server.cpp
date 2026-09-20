@@ -6,11 +6,42 @@
 #include <thread>
 
 #include "shuzagram/mtproto/crypto/message_cipher.hpp"
+#include "shuzagram/mtproto/messages/system.hpp"
 #include "shuzagram/mtproto/session.hpp"
 #include "shuzagram/mtproto/transport/detect_transport.hpp"
+#include "shuzagram/mtproto/unencrypted_message.hpp"
 
 namespace shuzagram::mtproto {
 namespace {
+
+// The real client that motivated NOTES/server-exchange-msgs-ack-plan.md
+// acks every server-sent handshake message with a plaintext msgs_ack --
+// including dh_gen_ok, the server's LAST plaintext reply, which arrives
+// after this loop has already switched to treating every frame as an
+// encrypted session message. A stray plaintext msgs_ack here would
+// otherwise be misread as an encrypted frame with auth_key_id == 0 (its
+// 8-byte zero auth_key_id envelope prefix), which never matches the real
+// derived key -- "unknown auth key id". A real auth_key_id is a
+// cryptographic hash and is never actually zero, so treating an
+// all-zero-prefixed frame as a stray plaintext ack (rather than a
+// malformed encrypted one) is safe.
+bool IsPlaintextMsgsAck(const std::vector<std::uint8_t>& frame) {
+    if (frame.size() < 8) return false;
+    for (int i = 0; i < 8; ++i) {
+        if (frame[i] != 0) return false;
+    }
+    try {
+        TLBuffer buf;
+        buf.buf = frame;
+        UnencryptedMessage msg;
+        msg.Decode(buf);
+        TLBuffer peek;
+        peek.buf = msg.message_data;
+        return peek.PeekID() == messages::MsgsAck::kTypeId;
+    } catch (...) {
+        return false;
+    }
+}
 
 // Temporary field diagnostic (SHUZAGRAM_DEBUG_TRANSPORT=1): dumps every raw
 // byte a connection actually sent, regardless of where parsing failed, to
@@ -90,7 +121,10 @@ void TcpHandshakeServer::Run(const SuccessHandler& on_success, const FailureHand
                 MtprotoSession session(result.auth_key, /*session_id=*/0, result.server_salt, crypto::Side::kServer,
                                        rpc_registry_);
                 for (;;) {
-                    const auto frame = detected.codec->Read(detected.read);
+                    std::vector<std::uint8_t> frame;
+                    do {
+                        frame = detected.codec->Read(detected.read);
+                    } while (IsPlaintextMsgsAck(frame));
                     TLBuffer frame_buf;
                     frame_buf.buf = frame;
                     crypto::EncryptedMessage encrypted;

@@ -302,6 +302,27 @@ int main() {
     }
     Check(hs.auth_key == server_handshake_result.auth_key, "client/server auth_key still matches before RPC phase");
 
+    // The real Android client that motivated NOTES/server-exchange-msgs-ack-plan.md
+    // acks EVERY server handshake message, including dh_gen_ok -- the
+    // server's LAST plaintext reply, sent after this connection has
+    // already switched from ServerExchange to MtprotoSession. Without the
+    // corresponding skip in tcp_handshake_server.cpp's post-handshake read
+    // loop, this stray plaintext frame's all-zero auth_key_id envelope
+    // prefix gets misread as an encrypted frame with auth_key_id == 0,
+    // failing with "unknown auth key id" on the very next real message.
+    {
+        messages::MsgsAck ack;
+        ack.msg_ids = {hs.server_salt}; // arbitrary; server discards the ack outright
+        TLBuffer ack_payload;
+        ack.Encode(ack_payload);
+        UnencryptedMessage ack_msg;
+        ack_msg.message_id = MessageId::New(std::chrono::system_clock::now(), MessageType::kFromClient).Raw();
+        ack_msg.message_data = ack_payload.buf;
+        TLBuffer framed;
+        ack_msg.Encode(framed);
+        codec.Write(socket.Writer(), framed.buf);
+    }
+
     // --- Now the actual capstone: real encrypted traffic over the same connection ---
     const std::int64_t session_id = 555444333;
     auto send_encrypted = [&](const std::vector<std::uint8_t>& payload, std::int64_t msg_id, std::int32_t seq_no) {
