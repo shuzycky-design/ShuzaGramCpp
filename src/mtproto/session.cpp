@@ -122,10 +122,26 @@ std::vector<std::uint8_t> MtprotoSession::DispatchOne(std::int64_t msg_id, const
         if (const RpcHandler* handler = registry_->Find(id)) {
             b.ConsumeID(id);
             const RpcContext ctx{crypto::AuthKeyId(auth_key_), session_id_};
+            // Captured BEFORE the handler runs and possibly throws: a
+            // handler decode failure needs the exact plaintext bytes to
+            // diagnose (this is already-decrypted RPC content, not
+            // wire-encrypted -- SHUZAGRAM_DEBUG_TRANSPORT already implies
+            // willingness to see raw protocol bytes in this log).
+            const std::vector<std::uint8_t> body_snapshot(b.buf);
             try {
                 result = (*handler)(id, b, ctx);
             } catch (const std::exception& e) {
-                if (debug) std::fprintf(stderr, "[rpc debug] method=0x%08x handler threw: %s\n", id, e.what());
+                if (debug) {
+                    std::string hex;
+                    hex.reserve(body_snapshot.size() * 2);
+                    static const char kHex[] = "0123456789abcdef";
+                    for (const auto byte : body_snapshot) {
+                        hex.push_back(kHex[byte >> 4]);
+                        hex.push_back(kHex[byte & 0xF]);
+                    }
+                    std::fprintf(stderr, "[rpc debug] method=0x%08x handler threw: %s; body (%zu bytes): %s\n", id,
+                                  e.what(), body_snapshot.size(), hex.c_str());
+                }
                 throw;
             }
         }
