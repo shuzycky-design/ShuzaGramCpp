@@ -10,6 +10,7 @@
 #include "shuzagram/mtproto/session.hpp"
 #include "shuzagram/mtproto/transport/detect_transport.hpp"
 #include "shuzagram/mtproto/unencrypted_message.hpp"
+#include "shuzagram/mtproto/unexpected_encrypted_frame.hpp"
 
 namespace shuzagram::mtproto {
 namespace {
@@ -68,8 +69,11 @@ void LogRawBytes(const std::vector<std::uint8_t>& bytes, const char* what) {
 } // namespace
 
 TcpHandshakeServer::TcpHandshakeServer(const std::string& bind_address, std::uint16_t port, crypto::RsaPrivateKey key,
-                                        const RpcHandlerRegistry* rpc_registry)
-    : listener_(bind_address, port), key_(std::move(key)), rpc_registry_(rpc_registry) {}
+                                        const RpcHandlerRegistry* rpc_registry, AuthKeyResolver auth_key_resolver)
+    : listener_(bind_address, port),
+      key_(std::move(key)),
+      rpc_registry_(rpc_registry),
+      auth_key_resolver_(std::move(auth_key_resolver)) {}
 
 void TcpHandshakeServer::Run(const SuccessHandler& on_success, const FailureHandler& on_failure) {
     // Polls with a short timeout rather than blocking in Accept()
@@ -104,11 +108,46 @@ void TcpHandshakeServer::Run(const SuccessHandler& on_success, const FailureHand
                 // NOTES/obfuscated2-transport-plan.md. No MTProxy secret:
                 // this server is a direct DC, not a proxy hop.
                 transport::DetectedTransport detected = transport::DetectTransport(reader, writer);
+
+                crypto::AuthKeyBytes session_auth_key{};
+                std::int64_t session_server_salt = 0;
+                std::optional<std::vector<std::uint8_t>> pending_first_frame;
+
                 ServerExchange exchange(key_);
-                const ServerExchangeResult result = exchange.Run(
-                    [&] { return detected.codec->Read(detected.read); },
-                    [&](const std::vector<std::uint8_t>& frame) { detected.codec->Write(detected.write, frame); });
-                if (on_success) on_success(result);
+                try {
+                    const ServerExchangeResult result = exchange.Run(
+                        [&] { return detected.codec->Read(detected.read); },
+                        [&](const std::vector<std::uint8_t>& frame) {
+                            detected.codec->Write(detected.write, frame);
+                        });
+                    if (on_success) on_success(result);
+                    session_auth_key = result.auth_key;
+                    session_server_salt = result.server_salt;
+                } catch (const UnexpectedEncryptedFrameError& e) {
+                    // A real client that already holds an auth key for this
+                    // server (from an earlier connection) skips the
+                    // handshake on reconnect and sends an encrypted frame
+                    // straight away -- ServerExchange has no way to process
+                    // that itself (see the header comment on
+                    // UnexpectedEncryptedFrameError: it must NOT just be
+                    // treated as a failed handshake, since blindly replying
+                    // -404 here is exactly what causes Telegram Desktop to
+                    // decide its key was destroyed and storm the server with
+                    // reconnects). Resolve the key out-of-band instead and,
+                    // if found, resume serving THIS frame as the first
+                    // message of that existing session.
+                    if (!rpc_registry_ || !auth_key_resolver_) throw;
+                    const std::optional<ResolvedAuthKey> resolved = auth_key_resolver_(e.auth_key_id());
+                    if (!resolved) {
+                        TLBuffer err;
+                        err.PutInt32(-kCodeAuthKeyNotFound);
+                        detected.codec->Write(detected.write, err.buf);
+                        throw;
+                    }
+                    session_auth_key = resolved->auth_key;
+                    session_server_salt = resolved->server_salt;
+                    pending_first_frame = e.frame();
+                }
 
                 if (!rpc_registry_) return; // old behavior: close right after the handshake
 
@@ -118,13 +157,9 @@ void TcpHandshakeServer::Run(const SuccessHandler& on_success, const FailureHand
                 // session_id starts at 0 -- MtprotoSession adopts the
                 // client's real one from the first decrypted message (see
                 // its own header comment).
-                MtprotoSession session(result.auth_key, /*session_id=*/0, result.server_salt, crypto::Side::kServer,
+                MtprotoSession session(session_auth_key, /*session_id=*/0, session_server_salt, crypto::Side::kServer,
                                        rpc_registry_);
-                for (;;) {
-                    std::vector<std::uint8_t> frame;
-                    do {
-                        frame = detected.codec->Read(detected.read);
-                    } while (IsPlaintextMsgsAck(frame));
+                auto handle_frame = [&](const std::vector<std::uint8_t>& frame) {
                     TLBuffer frame_buf;
                     frame_buf.buf = frame;
                     crypto::EncryptedMessage encrypted;
@@ -136,6 +171,16 @@ void TcpHandshakeServer::Run(const SuccessHandler& on_success, const FailureHand
                         reply.Encode(out);
                         detected.codec->Write(detected.write, out.buf);
                     }
+                };
+
+                if (pending_first_frame) handle_frame(*pending_first_frame);
+
+                for (;;) {
+                    std::vector<std::uint8_t> frame;
+                    do {
+                        frame = detected.codec->Read(detected.read);
+                    } while (IsPlaintextMsgsAck(frame));
+                    handle_frame(frame);
                 }
             } catch (const std::exception& e) {
                 if (debug) LogRawBytes(*raw_log, e.what());

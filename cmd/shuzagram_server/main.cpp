@@ -753,8 +753,42 @@ int main() {
                     "account.updateBirthday are wired up\n");
     }
 
-    mtproto::TcpHandshakeServer server(bind_address, static_cast<std::uint16_t>(port), std::move(key),
-                                        &rpc_registry);
+    // A real client that already holds an auth key for this server (from an
+    // earlier connection) skips the handshake on reconnect and sends an
+    // encrypted frame straight away -- without this, TcpHandshakeServer has
+    // no way to serve that connection and just drops it (see
+    // UnexpectedEncryptedFrameError's header comment). All validity rules
+    // (existence, expiry, migration-artifact rejection) live here, not in
+    // TcpHandshakeServer, per its own doc comment.
+    mtproto::TcpHandshakeServer::AuthKeyResolver auth_key_resolver;
+    if (auth_key_store) {
+        auth_key_resolver =
+            [&](const std::array<std::uint8_t, 8>& id) -> std::optional<mtproto::ResolvedAuthKey> {
+            std::optional<store::AuthKeyData> data;
+            try {
+                std::lock_guard<std::mutex> lock(db_mutex);
+                data = auth_key_store->Get(id);
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "auth_key lookup for resumed session failed: %s\n", e.what());
+                return std::nullopt;
+            }
+            if (!data) return std::nullopt;
+            // expires_at == -1: an unprovable migration-era row -- must be
+            // rejected (see AuthKeyData::expires_at's own doc comment).
+            if (data->expires_at < 0) return std::nullopt;
+            const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                                  std::chrono::system_clock::now().time_since_epoch())
+                                  .count();
+            if (data->expires_at > 0 && data->expires_at <= now) return std::nullopt; // expired temporary key
+            mtproto::ResolvedAuthKey resolved;
+            resolved.auth_key = data->value;
+            resolved.server_salt = data->server_salt;
+            return resolved;
+        };
+    }
+
+    mtproto::TcpHandshakeServer server(bind_address, static_cast<std::uint16_t>(port), std::move(key), &rpc_registry,
+                                        auth_key_resolver);
     std::printf("listening on %s:%d\n", bind_address.c_str(), server.Port());
 
     g_server.store(&server);

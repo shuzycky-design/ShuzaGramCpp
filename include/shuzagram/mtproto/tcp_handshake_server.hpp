@@ -1,9 +1,13 @@
 #pragma once
 
+#include <array>
 #include <atomic>
+#include <cstdint>
 #include <functional>
+#include <optional>
 #include <string>
 
+#include "shuzagram/mtproto/crypto/message_cipher.hpp"
 #include "shuzagram/mtproto/crypto/rsa.hpp"
 #include "shuzagram/mtproto/rpc_dispatch.hpp"
 #include "shuzagram/mtproto/server_exchange.hpp"
@@ -22,8 +26,27 @@
 // is the only place that wires the two together.
 namespace shuzagram::mtproto {
 
+// A previously-established auth key, resolved out-of-band (typically from
+// store::IAuthKeyStore) so a reconnecting client that skips the handshake
+// entirely -- see AuthKeyResolver below -- can resume being served instead
+// of having its connection dropped.
+struct ResolvedAuthKey {
+    crypto::AuthKeyBytes auth_key{};
+    std::int64_t server_salt = 0;
+};
+
 class TcpHandshakeServer {
 public:
+    // Looks up an existing auth key by id, or nullopt if it's unknown/no
+    // longer valid (expired, revoked, ...). Deliberately a callback rather
+    // than a direct store::IAuthKeyStore dependency, for the same reason
+    // on_success/on_failure are callbacks: this class stays exercisable in
+    // tests without a live Postgres, and cmd/shuzagram_server is the only
+    // place that wires the two together. Whatever validity rules apply
+    // (existence, expiry, migration-artifact rejection, ...) are entirely
+    // the resolver's responsibility.
+    using AuthKeyResolver = std::function<std::optional<ResolvedAuthKey>(const std::array<std::uint8_t, 8>&)>;
+
     // rpc_registry == nullptr (the default): a connection is closed right
     // after its handshake completes, exactly as in the first TCP-wiring
     // round -- what every existing caller/test still gets unchanged.
@@ -33,8 +56,17 @@ public:
     // registry itself has no business handlers registered), until the
     // connection closes or a session-level error occurs. The pointee must
     // outlive this server.
+    //
+    // auth_key_resolver (only consulted when rpc_registry is also set): a
+    // real client that already holds an auth key for this server (from an
+    // earlier connection) skips the handshake on reconnect and sends an
+    // encrypted frame straight away -- ServerExchange can't handle that
+    // itself (see UnexpectedEncryptedFrameError's header comment for why
+    // this must not just be treated as a handshake failure). Left unset,
+    // such a connection is simply dropped, same as before this parameter
+    // existed.
     TcpHandshakeServer(const std::string& bind_address, std::uint16_t port, crypto::RsaPrivateKey key,
-                        const RpcHandlerRegistry* rpc_registry = nullptr);
+                        const RpcHandlerRegistry* rpc_registry = nullptr, AuthKeyResolver auth_key_resolver = {});
 
     [[nodiscard]] std::uint16_t Port() const { return listener_.Port(); }
 
@@ -63,6 +95,7 @@ private:
     net::TcpListener listener_;
     crypto::RsaPrivateKey key_;
     const RpcHandlerRegistry* rpc_registry_;
+    AuthKeyResolver auth_key_resolver_;
     std::atomic<bool> stopping_{false};
 };
 
