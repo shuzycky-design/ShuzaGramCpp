@@ -151,7 +151,15 @@ ServerExchangeResult ServerExchange::Run(const ReadFrame& read, const WriteFrame
     // never touches either).
     ReqPq req;
     {
-        const UnencryptedMessage first = ReadHandshakeMessage(read);
+        // ReadNextRealHandshakeMessage, not the plain ReadHandshakeMessage:
+        // a real client that already completed a permanent-key handshake
+        // over this same connection acks that handshake's dh_gen_ok with a
+        // plaintext msgs_ack before immediately starting a SECOND handshake
+        // (for a temporary/PFS key) right here -- see
+        // NOTES/temp-key-handshake-loop-plan.md. Harmless when this really
+        // is the connection's first-ever handshake and no such ack exists
+        // to skip.
+        const UnencryptedMessage first = ReadNextRealHandshakeMessage(read);
         TLBuffer b;
         b.buf = first.message_data;
         req.Decode(b);

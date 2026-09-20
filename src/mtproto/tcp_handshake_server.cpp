@@ -111,42 +111,66 @@ void TcpHandshakeServer::Run(const SuccessHandler& on_success, const FailureHand
 
                 crypto::AuthKeyBytes session_auth_key{};
                 std::int64_t session_server_salt = 0;
+                bool have_key = false;
                 std::optional<std::vector<std::uint8_t>> pending_first_frame;
 
-                ServerExchange exchange(key_);
-                try {
-                    const ServerExchangeResult result = exchange.Run(
-                        [&] { return detected.codec->Read(detected.read); },
-                        [&](const std::vector<std::uint8_t>& frame) {
-                            detected.codec->Write(detected.write, frame);
-                        });
-                    if (on_success) on_success(result);
-                    session_auth_key = result.auth_key;
-                    session_server_salt = result.server_salt;
-                } catch (const UnexpectedEncryptedFrameError& e) {
-                    // A real client that already holds an auth key for this
-                    // server (from an earlier connection) skips the
-                    // handshake on reconnect and sends an encrypted frame
-                    // straight away -- ServerExchange has no way to process
-                    // that itself (see the header comment on
-                    // UnexpectedEncryptedFrameError: it must NOT just be
-                    // treated as a failed handshake, since blindly replying
-                    // -404 here is exactly what causes Telegram Desktop to
-                    // decide its key was destroyed and storm the server with
-                    // reconnects). Resolve the key out-of-band instead and,
-                    // if found, resume serving THIS frame as the first
-                    // message of that existing session.
-                    if (!rpc_registry_ || !auth_key_resolver_) throw;
-                    const std::optional<ResolvedAuthKey> resolved = auth_key_resolver_(e.auth_key_id());
-                    if (!resolved) {
-                        TLBuffer err;
-                        err.PutInt32(-kCodeAuthKeyNotFound);
-                        detected.codec->Write(detected.write, err.buf);
-                        throw;
+                // A real client establishes its permanent auth_key, then
+                // immediately runs a SECOND, independent DH exchange over
+                // the SAME connection to establish a temporary (PFS) key --
+                // and only after that switches to encrypted traffic under
+                // the temp key. Loop ServerExchange::Run() to allow for
+                // that; it ends the loop by throwing
+                // UnexpectedEncryptedFrameError once what follows the most
+                // recent handshake genuinely isn't another one. See
+                // NOTES/temp-key-handshake-loop-plan.md.
+                for (;;) {
+                    ServerExchange exchange(key_);
+                    try {
+                        const ServerExchangeResult result = exchange.Run(
+                            [&] { return detected.codec->Read(detected.read); },
+                            [&](const std::vector<std::uint8_t>& frame) {
+                                detected.codec->Write(detected.write, frame);
+                            });
+                        if (on_success) on_success(result);
+                        session_auth_key = result.auth_key;
+                        session_server_salt = result.server_salt;
+                        have_key = true;
+                        if (!rpc_registry_) break; // old behavior: don't even try to read more
+                        continue;
+                    } catch (const UnexpectedEncryptedFrameError& e) {
+                        if (have_key && e.auth_key_id() == crypto::AuthKeyId(session_auth_key)) {
+                            // Real traffic under the key THIS connection
+                            // just derived, sent immediately instead of a
+                            // second handshake -- no lookup needed.
+                            pending_first_frame = e.frame();
+                            break;
+                        }
+                        // A real client that already holds an auth key for
+                        // this server (from an earlier connection) skips
+                        // the handshake on reconnect and sends an encrypted
+                        // frame straight away -- ServerExchange has no way
+                        // to process that itself (see the header comment on
+                        // UnexpectedEncryptedFrameError: it must NOT just be
+                        // treated as a failed handshake, since blindly
+                        // replying -404 here is exactly what causes
+                        // Telegram Desktop to decide its key was destroyed
+                        // and storm the server with reconnects). Resolve
+                        // the key out-of-band instead and, if found, resume
+                        // serving THIS frame as the first message of that
+                        // existing session.
+                        if (!rpc_registry_ || !auth_key_resolver_) throw;
+                        const std::optional<ResolvedAuthKey> resolved = auth_key_resolver_(e.auth_key_id());
+                        if (!resolved) {
+                            TLBuffer err;
+                            err.PutInt32(-kCodeAuthKeyNotFound);
+                            detected.codec->Write(detected.write, err.buf);
+                            throw;
+                        }
+                        session_auth_key = resolved->auth_key;
+                        session_server_salt = resolved->server_salt;
+                        pending_first_frame = e.frame();
+                        break;
                     }
-                    session_auth_key = resolved->auth_key;
-                    session_server_salt = resolved->server_salt;
-                    pending_first_frame = e.frame();
                 }
 
                 if (!rpc_registry_) return; // old behavior: close right after the handshake

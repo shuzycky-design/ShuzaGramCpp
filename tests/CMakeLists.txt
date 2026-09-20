@@ -41,6 +41,10 @@ add_executable(net_tcp_key_resume_test net_tcp_key_resume_test.cpp)
 target_link_libraries(net_tcp_key_resume_test PRIVATE shuzagram_mtproto Threads::Threads)
 add_test(NAME net_tcp_key_resume_test COMMAND net_tcp_key_resume_test)
 
+add_executable(net_tcp_temp_key_handshake_test net_tcp_temp_key_handshake_test.cpp)
+target_link_libraries(net_tcp_temp_key_handshake_test PRIVATE shuzagram_mtproto Threads::Threads)
+add_test(NAME net_tcp_temp_key_handshake_test COMMAND net_tcp_temp_key_handshake_test)
+
 add_executable(manual_tcp_client_smoke manual_tcp_client_smoke.cpp)
 target_link_libraries(manual_tcp_client_smoke PRIVATE shuzagram_mtproto)
 
