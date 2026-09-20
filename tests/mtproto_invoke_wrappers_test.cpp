@@ -82,10 +82,8 @@ std::vector<std::uint8_t> WrapInitConnection(const std::vector<std::uint8_t>& in
 }
 
 // Same shape as WrapInitConnection but with the proxy flag (bit 0) set and
-// no actual InputClientProxy bytes following -- this project doesn't
-// decode that type, so the test only needs the flag bit, never valid proxy
-// data (UnwrapInvokeWrappers must throw before trying to read it).
-std::vector<std::uint8_t> WrapInitConnectionWithProxyFlag() {
+// a real inputClientProxy#75588b3f value following, then `inner`.
+std::vector<std::uint8_t> WrapInitConnectionWithProxy(const std::vector<std::uint8_t>& inner) {
     TLBuffer b;
     b.PutID(messages::kInitConnectionTypeId);
     b.PutUint32(1u << 0); // flags: proxy present
@@ -96,6 +94,56 @@ std::vector<std::uint8_t> WrapInitConnectionWithProxyFlag() {
     b.PutBytes({});
     b.PutBytes({});
     b.PutBytes({});
+    b.PutID(0x75588b3f); // inputClientProxy
+    b.PutBytes(std::vector<std::uint8_t>{'1', '.', '2', '.', '3', '.', '4'}); // address
+    b.PutInt32(443);                                                          // port
+    b.Put(inner);
+    return b.buf;
+}
+
+// A real JSONValue payload exercising every branch of SkipJsonValue:
+// jsonObject{"a": jsonArray[jsonNumber, jsonBool, jsonNull], "b": jsonString}.
+std::vector<std::uint8_t> EncodeSampleJsonValue() {
+    TLBuffer b;
+    b.PutID(0x99c1d49d); // jsonObject
+    b.PutVectorHeader(2);
+    {
+        b.PutID(0xc0de1bd9); // jsonObjectValue
+        b.PutBytes(std::vector<std::uint8_t>{'a'});
+        b.PutID(0xf7444763); // jsonArray
+        b.PutVectorHeader(3);
+        b.PutID(0x2be0dfa4); // jsonNumber
+        b.Put(std::vector<std::uint8_t>(8, 0));  // double bit pattern, value irrelevant
+        b.PutID(0xc7345e6a); // jsonBool
+        b.PutID(0x997275b5); // boolTrue
+        b.PutID(0x3f6d7b68); // jsonNull
+    }
+    {
+        b.PutID(0xc0de1bd9); // jsonObjectValue
+        b.PutBytes(std::vector<std::uint8_t>{'b'});
+        b.PutID(0xb71e767a); // jsonString
+        b.PutBytes(std::vector<std::uint8_t>{'h', 'i'});
+    }
+    return b.buf;
+}
+
+// Same shape as WrapInitConnection but with the params flag (bit 1) set
+// and a real, non-trivial JSONValue following, then `inner` -- exactly
+// what every real client this project has been tested against actually
+// sends on every single call.
+std::vector<std::uint8_t> WrapInitConnectionWithParams(const std::vector<std::uint8_t>& inner) {
+    TLBuffer b;
+    b.PutID(messages::kInitConnectionTypeId);
+    b.PutUint32(1u << 1); // flags: params present
+    b.PutInt32(12345);
+    b.PutBytes({});
+    b.PutBytes({});
+    b.PutBytes({});
+    b.PutBytes({});
+    b.PutBytes({});
+    b.PutBytes({});
+    b.Put(EncodeSampleJsonValue());
+    b.Put(inner);
     return b.buf;
 }
 
@@ -178,17 +226,33 @@ void TestWrappedCallReachesRegisteredHandler() {
     Check(b.Long() == 999, "a wrapped call reaches a registered business-method handler, same as a bare call would");
 }
 
-void TestInitConnectionWithProxyFlagIsRejectedNotCrashed() {
+void TestInitConnectionWithProxyIsSkippedCorrectly() {
     const AuthKeyBytes key = RandomAuthKey();
     MtprotoSession server(key, 111, 222, Side::kServer);
-    const auto reply = Roundtrip(server, key, 222, 111, WrapInitConnectionWithProxyFlag());
+    const auto reply = Roundtrip(server, key, 222, 111, WrapInitConnectionWithProxy(EncodePing(5)));
     TLBuffer b;
     b.buf = reply.message_data;
-    b.ConsumeID(messages::RpcResult::kTypeId);
+    b.ConsumeID(messages::Pong::kTypeId);
     b.Long();
-    b.ConsumeID(messages::RpcError::kTypeId);
-    const int code = b.Int32();
-    Check(code == 500, "initConnection with an unsupported proxy field gets a clean error reply, not a crash/hang");
+    Check(b.Long() == 5, "initConnection with a real proxy value skips it correctly and reaches the real ping");
+}
+
+// Found live: every real client this project has been tested against
+// (OwpenGram) sets initConnection's params flag on literally every call.
+// Before SkipJsonValue existed, this made UnwrapInvokeWrappers throw for
+// every single real call, so nothing past the handshake was ever actually
+// reachable by a real client -- see NOTES/init-connection-params-plan.md.
+void TestInitConnectionWithParamsIsSkippedCorrectly() {
+    const AuthKeyBytes key = RandomAuthKey();
+    MtprotoSession server(key, 111, 222, Side::kServer);
+    const auto reply = Roundtrip(server, key, 222, 111, WrapInitConnectionWithParams(EncodePing(6)));
+    TLBuffer b;
+    b.buf = reply.message_data;
+    b.ConsumeID(messages::Pong::kTypeId);
+    b.Long();
+    Check(b.Long() == 6,
+          "initConnection with a real (object/array/number/bool/null/string) JSON params value skips it "
+          "correctly and reaches the real ping");
 }
 
 } // namespace
@@ -199,7 +263,8 @@ int main() {
     TestInitConnectionWrappedPing();
     TestDeeplyNestedWrappers();
     TestWrappedCallReachesRegisteredHandler();
-    TestInitConnectionWithProxyFlagIsRejectedNotCrashed();
+    TestInitConnectionWithProxyIsSkippedCorrectly();
+    TestInitConnectionWithParamsIsSkippedCorrectly();
     if (g_failures == 0) {
         std::printf("all mtproto invoke-wrapper tests passed\n");
         return 0;

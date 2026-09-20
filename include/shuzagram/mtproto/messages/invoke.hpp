@@ -2,7 +2,6 @@
 
 #include <cstdint>
 
-#include "shuzagram/domain/user_errors.hpp"
 #include "shuzagram/mtproto/tl_buffer.hpp"
 
 // The "invoke wrapper" TL constructors real clients use to wrap almost
@@ -31,6 +30,63 @@ inline constexpr std::uint32_t kInvokeWithoutUpdatesTypeId = 0xbf9459b7;
 inline constexpr std::uint32_t kInvokeAfterMsgTypeId = 0xcb9f372d;
 inline constexpr std::uint32_t kInitConnectionTypeId = 0xc1cd5ea9;
 
+// JSONValue (mt.tl): jsonNull#3f6d7b68 = JSONValue; jsonBool#c7345e6a
+// value:Bool = JSONValue; jsonNumber#2be0dfa4 value:double = JSONValue;
+// jsonString#b71e767a value:string = JSONValue; jsonArray#f7444763
+// value:Vector<JSONValue> = JSONValue; jsonObject#99c1d49d
+// value:Vector<JSONObjectValue> = JSONValue; jsonObjectValue#c0de1bd9
+// key:string value:JSONValue = JSONObjectValue.
+//
+// Every current real client (this was found live: OwpenGram sets this on
+// literally every call) sets initConnection's params flag to attach an
+// arbitrary JSON blob (tz_offset, perf_cat, ...) this server has no use
+// for -- but the buffer still has to be advanced past it correctly for
+// whatever comes after (the real RPC call) to parse at all. Recursively
+// walks and discards a JSONValue without needing to interpret it.
+inline void SkipJsonValue(TLBuffer& b) {
+    constexpr std::uint32_t kJsonNullTypeId = 0x3f6d7b68;
+    constexpr std::uint32_t kJsonBoolTypeId = 0xc7345e6a;
+    constexpr std::uint32_t kJsonNumberTypeId = 0x2be0dfa4;
+    constexpr std::uint32_t kJsonStringTypeId = 0xb71e767a;
+    constexpr std::uint32_t kJsonArrayTypeId = 0xf7444763;
+    constexpr std::uint32_t kJsonObjectTypeId = 0x99c1d49d;
+    constexpr std::uint32_t kJsonObjectValueTypeId = 0xc0de1bd9;
+
+    const std::uint32_t id = b.PeekID();
+    b.ConsumeID(id);
+    switch (id) {
+        case kJsonNullTypeId:
+            break;
+        case kJsonBoolTypeId: {
+            const std::uint32_t bool_id = b.PeekID();
+            b.ConsumeID(bool_id); // boolTrue/boolFalse, no further fields
+            break;
+        }
+        case kJsonNumberTypeId:
+            (void)b.Uint64(); // double, bit pattern doesn't matter to discard it
+            break;
+        case kJsonStringTypeId:
+            (void)b.GetBytes();
+            break;
+        case kJsonArrayTypeId: {
+            const auto count = b.VectorHeader();
+            for (int i = 0; i < count; ++i) SkipJsonValue(b);
+            break;
+        }
+        case kJsonObjectTypeId: {
+            const auto count = b.VectorHeader();
+            for (int i = 0; i < count; ++i) {
+                b.ConsumeID(kJsonObjectValueTypeId);
+                (void)b.GetBytes(); // key
+                SkipJsonValue(b);   // value
+            }
+            break;
+        }
+        default:
+            throw UnexpectedIdError(id);
+    }
+}
+
 // Repeatedly strips any of the four wrapper constructors above off the
 // FRONT of `b` (a client can nest them, e.g.
 // invokeWithLayer(initConnection(invokeWithoutUpdates(realCall)))),
@@ -39,16 +95,9 @@ inline constexpr std::uint32_t kInitConnectionTypeId = 0xc1cd5ea9;
 // these ids is left untouched (the common case once unwrapped, or a
 // legacy/bare call with no wrapper at all).
 //
-// initConnection's optional proxy (flags bit 0) and params (flags bit 1)
-// fields are NOT decoded -- both are rare (proxy is for MTProto-proxy
-// connections; params is an arbitrary JSON blob some clients attach) and
-// correctly skipping either needs a decoder this project doesn't have yet
-// (InputClientProxy, a generic JSONValue variant). A client that sets
-// either flag gets domain::NotImplementedError rather than a silently
-// corrupted parse of everything after it -- faithful-gap, not a silent
-// truncation bug. initConnection's device/app metadata (api_id,
-// device_model, ...) is likewise decoded and discarded, not yet persisted
-// into store::AuthKeyClientInfo -- that wiring is a separate future round.
+// initConnection's device/app metadata (api_id, device_model, ...) is
+// decoded and discarded, not yet persisted into store::AuthKeyClientInfo
+// -- that wiring is a separate future round.
 inline void UnwrapInvokeWrappers(TLBuffer& b) {
     for (;;) {
         const std::uint32_t id = b.PeekID();
@@ -76,8 +125,22 @@ inline void UnwrapInvokeWrappers(TLBuffer& b) {
             (void)b.GetBytes();  // system_lang_code
             (void)b.GetBytes();  // lang_pack
             (void)b.GetBytes();  // lang_code
-            if (flags & (1u << 0)) throw domain::NotImplementedError("initConnection with proxy");
-            if (flags & (1u << 1)) throw domain::NotImplementedError("initConnection with params");
+            // proxy:flags.0?InputClientProxy -- inputClientProxy#75588b3f
+            // address:string port:int = InputClientProxy (its only
+            // constructor, not a union like JSONValue).
+            if (flags & (1u << 0)) {
+                b.ConsumeID(0x75588b3f);
+                (void)b.GetBytes(); // address
+                (void)b.Int32();    // port
+            }
+            // params:flags.1?JSONValue -- found live: every real client
+            // this project has been tested against sets this
+            // unconditionally (tz_offset/perf_cat/... telemetry blob),
+            // so leaving it unhandled meant EVERY real call from a real
+            // client failed with a 500 INTERNAL error before even
+            // reaching the actual RPC method -- see
+            // NOTES/init-connection-params-plan.md.
+            if (flags & (1u << 1)) SkipJsonValue(b);
             continue;
         }
         return;
